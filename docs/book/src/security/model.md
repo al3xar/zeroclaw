@@ -49,7 +49,7 @@ When a sandbox backend is available, tool invocations run inside it. `sandbox_ba
 
 | Platform | Auto-detected order |
 |---|---|
-| Linux | Landlock (only when compiled with `sandbox-landlock`) → Firejail |
+| Linux | Landlock (only when compiled with `sandbox-landlock`) → Firejail → Bubblewrap (only when compiled with `sandbox-bubblewrap`) |
 | macOS | Bubblewrap (only when compiled with `sandbox-bubblewrap`) → Seatbelt (`sandbox-exec`) |
 | Windows | No OS-level backend |
 

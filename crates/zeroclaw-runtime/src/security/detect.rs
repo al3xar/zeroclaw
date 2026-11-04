@@ -251,6 +251,15 @@ fn detect_best_backend_with(
         if is_available(SelectedSandboxBackend::Firejail) {
             return SelectedSandboxBackend::Firejail;
         }
+
+        // Bubblewrap has no network and rejects coding CLI tools, so it stays
+        // behind every coding-CLI-capable backend. It only wins over `none`.
+        #[cfg(feature = "sandbox-bubblewrap")]
+        {
+            if is_available(SelectedSandboxBackend::Bubblewrap) {
+                return SelectedSandboxBackend::Bubblewrap;
+            }
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -1206,6 +1215,29 @@ mod tests {
         });
 
         assert_eq!(selected, SelectedSandboxBackend::Firejail);
+    }
+
+    #[cfg(all(feature = "sandbox-bubblewrap", target_os = "linux"))]
+    #[test]
+    fn linux_auto_selection_falls_back_to_bubblewrap_instead_of_none() {
+        let selected = detect_best_backend_with(RuntimeKind::Native, |backend| {
+            matches!(backend, SelectedSandboxBackend::Bubblewrap)
+        });
+
+        assert_eq!(selected, SelectedSandboxBackend::Bubblewrap);
+    }
+
+    #[cfg(all(feature = "sandbox-landlock", target_os = "linux"))]
+    #[test]
+    fn linux_auto_selection_prefers_landlock_over_bubblewrap() {
+        let selected = detect_best_backend_with(RuntimeKind::Native, |backend| {
+            matches!(
+                backend,
+                SelectedSandboxBackend::Landlock | SelectedSandboxBackend::Bubblewrap
+            )
+        });
+
+        assert_eq!(selected, SelectedSandboxBackend::Landlock);
     }
 
     #[test]
