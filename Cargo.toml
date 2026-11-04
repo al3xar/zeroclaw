@@ -292,6 +292,12 @@ default = [
     "gateway",
     "observability-prometheus",
     "schema-export",
+    # Native OS sandbox backends enabled by default in this fork so that a plain
+    # `cargo install --path .` produces a binary whose `sandbox_backend =
+    # "bubblewrap"` (or "landlock") actually activates. The upstream musl release
+    # ships without these, which makes the sandbox silently fall back to "none".
+    "sandbox-bubblewrap",
+    "sandbox-landlock",
 ]
 
 # The core agent runtime — agent loop, tools, persistence subsystems.
