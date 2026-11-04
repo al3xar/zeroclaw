@@ -30,11 +30,11 @@ for how a risk profile slots into the rest of the config.
 
 | Platform | Order tried |
 |---|---|
-| Linux | Landlock (only when compiled with `sandbox-landlock`) → Firejail |
+| Linux | Landlock (only when compiled with `sandbox-landlock`) → Firejail → Bubblewrap (only when compiled with `sandbox-bubblewrap`) |
 | macOS | Bubblewrap (only when compiled with `sandbox-bubblewrap`) → Seatbelt (`sandbox-exec`) |
 | Windows | No OS-level backend |
 
-Bubblewrap is not in the Linux auto-detection chain; it is only reachable by naming it explicitly. Landlock and Bubblewrap are compile-time features, and a build that does not enable one skips that backend entirely. Neither feature is in the `default` feature set or in the `dist` set the release build uses, so a stock build starts the Linux list at Firejail and the macOS list at Seatbelt.
+Bubblewrap comes last in the Linux auto-detection chain: it runs without network access and rejects coding CLI tools, so `auto` prefers any backend that supports them and picks Bubblewrap only when the alternative is `none`. Landlock and Bubblewrap are compile-time features, and a build that does not enable one skips that backend entirely. Both features are in the `default` feature set, so a plain `cargo build` or `cargo install --path .` starts the Linux list at Landlock. Builds that pass `--no-default-features` with their own feature list (the Docker images, `setup.bat`) include them only when that list names them.
 
 After the platform list, `auto` tries Docker only when the runtime kind is neither `native` nor `docker`. Docker is not part of the native runtime's automatic fallback: with `[runtime] kind = "native"` (the default), `auto` never selects Docker even when the daemon is reachable. Docker is also skipped when the runtime is already `docker`, because the runtime container is the boundary. The only other runtime kind, `cloudflare`, is rejected by `create_runtime` in `crates/zeroclaw-config/src/platform/mod.rs` as not implemented, so on a runnable configuration `auto` never reaches the Docker backend.
 
