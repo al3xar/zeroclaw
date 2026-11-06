@@ -5,6 +5,7 @@ use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::process::Command;
 use zeroclaw_config::platform::resolve_executable;
+use zeroclaw_config::schema::DockerRuntimeConfig;
 
 /// Docker sandbox backend
 #[derive(Debug, Clone)]
@@ -12,16 +13,55 @@ pub struct DockerSandbox {
     launcher: Option<PathBuf>,
     image: String,
     workspace_dir: Option<PathBuf>,
+    network: String,
+    memory_limit_mb: Option<u64>,
+    cpu_limit: Option<f64>,
+    read_only_rootfs: bool,
 }
 
 impl Default for DockerSandbox {
     fn default() -> Self {
+        let docker_cfg = DockerRuntimeConfig::default();
         Self {
             launcher: None,
             // Read from the config crate so the sandbox default and the
             // `[security.sandbox].image` serde default cannot drift apart.
             image: zeroclaw_config::schema::DEFAULT_SANDBOX_IMAGE.to_string(),
             workspace_dir: None,
+            network: docker_cfg.network,
+            memory_limit_mb: docker_cfg.memory_limit_mb,
+            cpu_limit: docker_cfg.cpu_limit,
+            // Legacy sandbox wrappers never passed --read-only; keep the
+            // default so unrelated callers (skills, auto-detect) behave as
+            // before. Callers that opt in via [runtime.docker] use
+            // `with_runtime_config` instead.
+            read_only_rootfs: false,
+        }
+    }
+}
+
+impl DockerSandbox {
+    /// Build a sandbox that inherits the per-agent `[runtime.docker]` settings
+    /// (network mode, rootfs read-only, cpu/memory limits) instead of the
+    /// isolation defaults, so a `net` risk profile can run container scans with
+    /// bridge networking.
+    pub fn with_runtime_config(
+        image: String,
+        workspace_dir: Option<PathBuf>,
+        runtime: &DockerRuntimeConfig,
+    ) -> std::io::Result<Self> {
+        Ok(Self::with_resolved_launcher(image, workspace_dir)?.apply_runtime_config(runtime))
+    }
+
+    /// Overlay the `[runtime.docker]` limits onto an already-resolved sandbox.
+    /// Zero limits mean "no explicit limit", matching the runtime adapter.
+    fn apply_runtime_config(self, runtime: &DockerRuntimeConfig) -> Self {
+        Self {
+            network: runtime.network.trim().to_string(),
+            memory_limit_mb: runtime.memory_limit_mb.filter(|mb| *mb > 0),
+            cpu_limit: runtime.cpu_limit.filter(|cpus| *cpus > 0.0),
+            read_only_rootfs: runtime.read_only_rootfs,
+            ..self
         }
     }
 }
@@ -85,6 +125,10 @@ impl DockerSandbox {
             launcher: Some(launcher),
             image,
             workspace_dir,
+            network: "none".to_string(),
+            memory_limit_mb: Some(512),
+            cpu_limit: Some(1.0),
+            read_only_rootfs: false,
         })
     }
 
@@ -107,6 +151,10 @@ impl DockerSandbox {
             launcher: Some(PathBuf::from("docker")),
             image: "alpine:latest".to_string(),
             workspace_dir: None,
+            network: "none".to_string(),
+            memory_limit_mb: Some(512),
+            cpu_limit: Some(1.0),
+            read_only_rootfs: false,
         }
     }
     fn wrap_command_with_program(
@@ -124,16 +172,28 @@ impl DockerSandbox {
             .collect();
 
         let mut docker_cmd = Command::new(&launcher);
-        docker_cmd.args([
-            "run",
-            "--rm",
-            "--memory",
-            "512m",
-            "--cpus",
-            "1.0",
-            "--network",
-            "none",
-        ]);
+        docker_cmd.args(["run", "--rm"]);
+
+        let network = self.network.trim();
+        if !network.is_empty() {
+            docker_cmd.args(["--network", network]);
+        }
+
+        if let Some(memory_limit_mb) = self.memory_limit_mb.filter(|mb| *mb > 0) {
+            docker_cmd.args(["--memory", &format!("{memory_limit_mb}m")]);
+        }
+
+        if let Some(cpu_limit) = self.cpu_limit.filter(|cpus| *cpus > 0.0) {
+            // Debug keeps the decimal point (`1.0`, not `1`), matching the
+            // historical flag value.
+            docker_cmd.args(["--cpus", &format!("{cpu_limit:?}")]);
+        }
+
+        if self.read_only_rootfs {
+            // A read-only rootfs still needs scratch space: most scanners and
+            // interpreters write temp files. tmpfs keeps it ephemeral.
+            docker_cmd.args(["--read-only", "--tmpfs", "/tmp"]);
+        }
 
         if let Some(workspace) = &self.workspace_dir {
             let workspace_str = workspace.to_string_lossy();
@@ -243,6 +303,10 @@ mod tests {
                 launcher: Some(docker.clone()),
                 image: "alpine:latest".into(),
                 workspace_dir: None,
+                network: "none".into(),
+                memory_limit_mb: Some(512),
+                cpu_limit: Some(1.0),
+                read_only_rootfs: false,
             };
             let security = Arc::new(SecurityPolicy {
                 autonomy: AutonomyLevel::Full,
@@ -381,11 +445,104 @@ mod tests {
     }
 
     #[test]
+    fn docker_wrap_command_applies_runtime_docker_config() {
+        let runtime = DockerRuntimeConfig {
+            network: "bridge".to_string(),
+            memory_limit_mb: Some(1024),
+            cpu_limit: Some(2.0),
+            read_only_rootfs: true,
+            ..DockerRuntimeConfig::default()
+        };
+        let sandbox = DockerSandbox::for_test().apply_runtime_config(&runtime);
+        let mut cmd = Command::new("echo");
+        sandbox.wrap_command(&mut cmd).unwrap();
+
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|s| s.to_string_lossy().to_string())
+            .collect();
+
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--network" && w[1] == "bridge"),
+            "must use the configured bridge network, got {args:?}"
+        );
+        assert!(
+            args.contains(&"--read-only".to_string()),
+            "must mount a read-only rootfs"
+        );
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--memory" && w[1] == "1024m"),
+            "must use the configured memory limit"
+        );
+        assert!(
+            args.windows(2).any(|w| w[0] == "--cpus" && w[1] == "2.0"),
+            "must use the configured cpu limit"
+        );
+        assert!(
+            args.windows(2).any(|w| w[0] == "--tmpfs" && w[1] == "/tmp"),
+            "read-only rootfs must keep a writable /tmp"
+        );
+    }
+
+    #[test]
+    fn docker_runtime_config_defaults_keep_isolation() {
+        let sandbox =
+            DockerSandbox::for_test().apply_runtime_config(&DockerRuntimeConfig::default());
+        let mut cmd = Command::new("echo");
+        sandbox.wrap_command(&mut cmd).unwrap();
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|s| s.to_string_lossy().to_string())
+            .collect();
+
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--network" && w[1] == "none")
+        );
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--memory" && w[1] == "512m")
+        );
+        assert!(args.windows(2).any(|w| w[0] == "--cpus" && w[1] == "1.0"));
+        assert!(args.contains(&"--read-only".to_string()));
+    }
+
+    #[test]
+    fn docker_wrap_command_omits_zero_limits() {
+        let sandbox = DockerSandbox {
+            launcher: Some(PathBuf::from("docker")),
+            image: "alpine:latest".to_string(),
+            workspace_dir: None,
+            network: "bridge".to_string(),
+            memory_limit_mb: None,
+            cpu_limit: None,
+            read_only_rootfs: false,
+        };
+        let mut cmd = Command::new("echo");
+        sandbox.wrap_command(&mut cmd).unwrap();
+
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|s| s.to_string_lossy().to_string())
+            .collect();
+
+        assert!(!args.contains(&"--memory".to_string()));
+        assert!(!args.contains(&"--cpus".to_string()));
+        assert!(!args.contains(&"--read-only".to_string()));
+    }
+
+    #[test]
     fn docker_wrap_command_uses_custom_image() {
         let sandbox = DockerSandbox {
             launcher: Some(PathBuf::from("docker")),
             image: "ubuntu:22.04".to_string(),
             workspace_dir: None,
+            network: "none".into(),
+            memory_limit_mb: Some(512),
+            cpu_limit: Some(1.0),
+            read_only_rootfs: false,
         };
         let mut cmd = Command::new("echo");
         sandbox.wrap_command(&mut cmd).unwrap();
@@ -410,6 +567,10 @@ mod tests {
             launcher: Some(PathBuf::from("docker")),
             image: "alpine:latest".to_string(),
             workspace_dir: Some(ws_path.clone()),
+            network: "none".into(),
+            memory_limit_mb: Some(512),
+            cpu_limit: Some(1.0),
+            read_only_rootfs: false,
         };
         assert_eq!(sandbox.workspace_dir, Some(ws_path));
     }
@@ -426,6 +587,10 @@ mod tests {
             launcher: Some(launcher.clone()),
             image: "alpine:latest".to_string(),
             workspace_dir: None,
+            network: "none".into(),
+            memory_limit_mb: Some(512),
+            cpu_limit: Some(1.0),
+            read_only_rootfs: false,
         };
 
         assert!(sandbox.is_available());
@@ -447,6 +612,10 @@ mod tests {
             launcher: Some(PathBuf::from("docker")),
             image: "alpine:latest".to_string(),
             workspace_dir: Some(ws.clone()),
+            network: "none".into(),
+            memory_limit_mb: Some(512),
+            cpu_limit: Some(1.0),
+            read_only_rootfs: false,
         };
         let mut cmd = Command::new("python3");
         cmd.arg("script.py");

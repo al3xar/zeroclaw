@@ -1643,6 +1643,7 @@ fn runtime_shell_assembly(
         root_config.runtime.kind,
         Some(&security.workspace_dir),
         &sandbox_extra_roots,
+        Some(&root_config.runtime.docker),
     );
     let shell_tool = ShellTool::new_with_sandbox(security, runtime, sandbox.clone());
     RuntimeShellAssembly {

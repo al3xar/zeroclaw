@@ -3,7 +3,7 @@
 use crate::security::traits::Sandbox;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use zeroclaw_config::schema::{RuntimeKind, SandboxBackend, SandboxConfig};
+use zeroclaw_config::schema::{DockerRuntimeConfig, RuntimeKind, SandboxBackend, SandboxConfig};
 
 /// Extra filesystem roots beyond the primary workspace that a sandbox should
 /// also grant access to, mirroring `SecurityPolicy`'s allowed-roots tiers
@@ -423,6 +423,7 @@ pub fn create_sandbox(
     runtime_kind: RuntimeKind,
     workspace_dir: Option<&Path>,
     extra_roots: &SandboxExtraRoots,
+    docker_runtime: Option<&DockerRuntimeConfig>,
 ) -> Arc<dyn Sandbox> {
     let backend = &sandbox.backend;
 
@@ -438,6 +439,7 @@ pub fn create_sandbox(
             extra_roots,
             &sandbox.image,
             &sandbox.firejail_args,
+            docker_runtime,
         ),
         requested => {
             let (selected, unavailable_reason) =
@@ -458,6 +460,7 @@ pub fn create_sandbox(
                 extra_roots,
                 &sandbox.image,
                 &sandbox.firejail_args,
+                docker_runtime,
             ) {
                 return built;
             }
@@ -476,15 +479,21 @@ fn detect_best_sandbox(
     extra_roots: &SandboxExtraRoots,
     image: &str,
     firejail_args: &[String],
+    docker_runtime: Option<&DockerRuntimeConfig>,
 ) -> Arc<dyn Sandbox> {
     let selected = detect_best_backend(runtime_kind, workspace_dir, extra_roots);
     if matches!(selected, SelectedSandboxBackend::DockerRuntime) {
         log_auto_backend_selection(selected, runtime_kind);
         return Arc::new(super::traits::NoopSandbox);
     }
-    if let Some(sandbox) =
-        create_selected_sandbox(selected, workspace_dir, extra_roots, image, firejail_args)
-    {
+    if let Some(sandbox) = create_selected_sandbox(
+        selected,
+        workspace_dir,
+        extra_roots,
+        image,
+        firejail_args,
+        docker_runtime,
+    ) {
         log_auto_backend_selection(selected, runtime_kind);
         return sandbox;
     }
@@ -588,6 +597,7 @@ fn create_selected_sandbox(
     extra_roots: &SandboxExtraRoots,
     image: &str,
     firejail_args: &[String],
+    docker_runtime: Option<&DockerRuntimeConfig>,
 ) -> Option<Arc<dyn Sandbox>> {
     match selected {
         SelectedSandboxBackend::None => None,
@@ -643,7 +653,16 @@ fn create_selected_sandbox(
             }
         }
         SelectedSandboxBackend::Docker => {
-            let result = if let Some(ws) = workspace_dir {
+            let result = if let Some(docker_cfg) = docker_runtime {
+                // Honor the per-agent [runtime.docker] settings (network,
+                // rootfs, cpu/memory) so e.g. a `net` profile can run scans
+                // with bridge networking instead of the isolation default.
+                super::docker::DockerSandbox::with_runtime_config(
+                    image.to_string(),
+                    workspace_dir.map(Path::to_path_buf),
+                    docker_cfg,
+                )
+            } else if let Some(ws) = workspace_dir {
                 super::docker::DockerSandbox::with_workspace(image.to_string(), ws.to_path_buf())
             } else {
                 super::docker::DockerSandbox::with_image(image.to_string())
@@ -898,6 +917,7 @@ mod tests {
                 RuntimeKind::Native,
                 Some(fixture.path()),
                 &extra_roots,
+                None,
             );
             assert_eq!(sandbox.name(), "sandbox-exec");
             assert!(!sandbox.is_available());
@@ -916,6 +936,7 @@ mod tests {
                 RuntimeKind::Native,
                 Some(fixture.path()),
                 &extra_roots,
+                None,
             );
             assert_eq!(disabled.name(), "none");
             assert!(disabled.check_initialization().is_ok());
@@ -941,6 +962,7 @@ mod tests {
             RuntimeKind::Native,
             Some(fixture.path()),
             &SandboxExtraRoots::default(),
+            None,
         );
         assert_eq!(sandbox.name(), "sandbox-exec");
         assert!(sandbox.is_available());
@@ -966,6 +988,7 @@ mod tests {
                 "--net=none".to_string(),
                 "--profile=/tmp/weaker.profile".to_string(),
             ],
+            None,
         )
         .expect("rejected firejail_args must not fall back to no sandbox");
         assert_eq!(sandbox.name(), "firejail");
@@ -1024,6 +1047,7 @@ mod tests {
             &SandboxExtraRoots::default(),
             DEFAULT_SANDBOX_IMAGE,
             &[],
+            None,
         );
         // Should always return at least NoopSandbox
         assert!(sandbox.is_available());
@@ -1042,6 +1066,7 @@ mod tests {
             RuntimeKind::Cloudflare,
             None,
             &SandboxExtraRoots::default(),
+            None,
         );
         assert_eq!(sandbox.name(), "none");
     }
@@ -1078,6 +1103,7 @@ mod tests {
             RuntimeKind::Cloudflare,
             None,
             &SandboxExtraRoots::default(),
+            None,
         );
         // Should return some sandbox (at least NoopSandbox)
         assert!(sandbox.is_available());
@@ -1094,6 +1120,7 @@ mod tests {
             &SandboxExtraRoots::default(),
             DEFAULT_SANDBOX_IMAGE,
             &[],
+            None,
         );
         assert_ne!(sandbox.name(), "docker");
     }
@@ -1128,6 +1155,7 @@ mod tests {
             RuntimeKind::Native,
             None,
             &SandboxExtraRoots::default(),
+            None,
         );
         let posture = sandbox_posture(
             &sandbox_cfg,
@@ -1154,6 +1182,7 @@ mod tests {
             RuntimeKind::Native,
             None,
             &SandboxExtraRoots::default(),
+            None,
         );
         // If Docker is available, it will be selected; if not, NoopSandbox fallback.
         assert!(sandbox.is_available());
@@ -1329,6 +1358,7 @@ mod tests {
             RuntimeKind::Docker,
             None,
             &SandboxExtraRoots::default(),
+            None,
         );
 
         assert_eq!(sandbox.name(), "none");
