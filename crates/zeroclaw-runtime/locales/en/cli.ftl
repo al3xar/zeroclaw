@@ -964,6 +964,8 @@ cli-security-status-approvals = Approvals:  medium-risk approval required: {$med
 cli-security-status-sandbox = Sandbox:    requested {$requested}, active {$active} ({$description})
 cli-security-status-sandbox-description-docker-runtime = Docker runtime container isolation (runtime.kind = "docker"; no additional sandbox wrapper)
 cli-security-status-sandbox-description-firejail-args-rejected = Firejail selected, but firejail_args were rejected; commands are blocked ({$reason})
+cli-security-sandbox-backend-unavailable = {$backend} sandbox backend requested but not available; commands are blocked ({$reason})
+cli-security-sandbox-backend-unavailable-no-reason = {$backend} sandbox backend requested but not available; commands are blocked
 cli-security-firejail-args-error-empty = firejail_args rejected: an entry is empty
 cli-security-firejail-args-error-whitespace = firejail_args rejected: {$arg} has leading or trailing whitespace
 cli-security-firejail-args-error-not-option = firejail_args rejected: {$arg} is not a Firejail option; write each option as one `--option` or `--option=value` entry

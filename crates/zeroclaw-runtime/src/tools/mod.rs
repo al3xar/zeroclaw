@@ -4494,6 +4494,70 @@ mod tests {
         }
     }
 
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn registry_rejects_explicit_unavailable_sandbox_backend() {
+        // sandbox-exec cannot be built off macOS, so an explicit request for it
+        // must fail the agent's registry with the reason instead of handing out
+        // tools that would run commands unsandboxed.
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp);
+        let memory: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(
+                &MemoryConfig {
+                    backend: "none".into(),
+                    ..MemoryConfig::default()
+                },
+                tmp.path(),
+                None,
+            )
+            .unwrap(),
+        );
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: tmp.path().to_path_buf(),
+            ..SecurityPolicy::default()
+        });
+        let build = |enabled| {
+            let risk = zeroclaw_config::schema::RiskProfileConfig {
+                sandbox_enabled: Some(enabled),
+                sandbox_backend: Some("sandbox-exec".into()),
+                ..zeroclaw_config::schema::RiskProfileConfig::default()
+            };
+            all_tools_with_runtime(
+                Arc::new(cfg.clone()),
+                &security,
+                &risk,
+                "test-agent",
+                Arc::new(zeroclaw_config::platform::NativeRuntime::new()),
+                memory.clone(),
+                None,
+                None,
+                &BrowserConfig::default(),
+                &zeroclaw_config::schema::HttpRequestConfig::default(),
+                &zeroclaw_config::schema::WebFetchConfig::default(),
+                tmp.path(),
+                &HashMap::new(),
+                None,
+                &cfg,
+                None,
+                false,
+                None,
+                None,
+                None,
+                None,
+            )
+        };
+        let error = build(true)
+            .err()
+            .expect("registry must reject an unavailable explicit sandbox backend");
+        let reason = crate::i18n::get_required_cli_string_with_args(
+            "cli-security-sandbox-backend-unavailable-no-reason",
+            &[("backend", "sandbox-exec")],
+        );
+        assert_eq!(error.to_string(), format!("agents.test-agent: {reason}"));
+        assert!(build(false).is_ok());
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn registry_reports_seatbelt_initialization_before_tool_execution() {

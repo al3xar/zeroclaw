@@ -40,7 +40,7 @@ After the platform list, `auto` tries Docker only when the runtime kind is neith
 
 When nothing on the list is available, selection ends at `none` on the native runtime: no OS-level sandbox wraps tool calls, and only the application-layer security described above applies. On the Docker runtime it ends at `docker-runtime` instead, keeping the container boundary with no second sandbox wrapper.
 
-Naming a backend explicitly does not walk this list. If the requested backend is not compiled in, does not work on the platform, is not compatible with the runtime kind, or fails its availability probe, selection goes straight to `none` (native) or `docker-runtime` (Docker runtime), not to the next backend.
+Naming a backend explicitly does not walk this list. If the requested backend is not compiled in, does not work on the platform, is not compatible with the runtime kind, fails its availability probe, or cannot be constructed, ZeroClaw does not try the next backend and does not run commands unsandboxed. On the native runtime the agent fails closed: building its tool registry fails with `agents.<alias>: <Backend> sandbox backend requested but not available; commands are blocked`, followed by the probe's reason when one is known, and a shell command that reaches the sandbox is refused with the same reason. `zeroclaw security status` reports the requested backend as active with that blocked description. On the Docker runtime the runtime container stays the boundary (`docker-runtime`) and no second wrapper is added. To run without an OS sandbox on purpose, set `sandbox_backend = "none"` or `sandbox_enabled = false`.
 
 To force a specific backend, set `sandbox_backend` to a backend name: `landlock`, `firejail`, `bubblewrap`, `docker`, `sandbox-exec`, or `none`.
 
@@ -194,7 +194,7 @@ No sandboxing. Tools run with the full privileges of the ZeroClaw service user. 
 
 ## Troubleshooting
 
-- **No sandbox is active**: check `zeroclaw service status` and the journal. Selection logs the backend it settled on ("Landlock sandbox enabled (Linux kernel 5.13+)", "No sandbox backend available, using application-layer security"), and a backend requested explicitly that isn't available warns with its name ("Firejail requested but not available, falling back to application-layer"). The log names the outcome, not every backend it tried.
+- **No sandbox is active**: check `zeroclaw service status` and the journal. Selection logs the backend it settled on ("Landlock sandbox enabled (Linux kernel 5.13+)", "No sandbox backend available, using application-layer security"), and a backend requested explicitly that isn't available warns with its name ("Firejail requested but not available; commands are blocked instead of running unsandboxed"). That agent's commands stay blocked until the backend is installed, or the profile names an available backend or `none`. The log names the outcome, not every backend it tried.
 - **Tools working on dev, failing in service**: the service user often differs from the CLI user. Verify both have whatever sandbox-adjacent permissions are needed (Landlock: nothing; Bubblewrap: userns enabled; Docker: service user in `docker` group).
 - **Slow tool invocations** on the Docker runtime: first invocation pulls the image, subsequent are fast. Pre-pull with `docker pull <image>`.
 

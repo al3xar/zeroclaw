@@ -59,8 +59,23 @@ pub fn sandbox_posture(
         return sandbox_posture_result(requested_backend, active.name(), active.description());
     }
 
-    let (active_backend, _) =
+    let (active_backend, unavailable_reason) =
         configured_backend_selection(&sandbox.backend, runtime_kind, workspace_dir, extra_roots);
+
+    // An explicitly requested backend that is unavailable blocks commands
+    // (see `create_sandbox`); it does not fall back to application-layer only.
+    if SelectedSandboxBackend::from_config(&sandbox.backend).is_some()
+        && matches!(active_backend, SelectedSandboxBackend::None)
+    {
+        return sandbox_posture_result(
+            requested_backend,
+            requested_backend,
+            requested_backend_unavailable_description(
+                selected_backend_label(&sandbox.backend),
+                unavailable_reason.as_deref(),
+            ),
+        );
+    }
 
     sandbox_posture_result(
         requested_backend,
@@ -287,7 +302,7 @@ fn detect_best_backend_with(
 
 /// Probe the explicitly requested backend and, when it refuses, return the
 /// explanation it produced. Only bubblewrap can explain itself today, so the
-/// other backends keep the generic fallback warning. The reason comes from the
+/// other backends keep the generic unavailable warning. The reason comes from the
 /// same probe that decided availability: re-probing on the failure path would
 /// run the launcher a second time, without a timeout, and could disagree with
 /// the first result.
@@ -464,11 +479,16 @@ pub fn create_sandbox(
             ) {
                 return built;
             }
+            // An explicitly requested backend that cannot be built must not
+            // silently degrade to running commands unsandboxed.
             log_requested_backend_unavailable(
                 selected_backend_label(requested),
-                unavailable_reason,
+                unavailable_reason.as_deref(),
             );
-            Arc::new(super::traits::NoopSandbox)
+            Arc::new(BlockedSandbox::requested_unavailable(
+                requested,
+                unavailable_reason.as_deref(),
+            ))
         }
     }
 }
@@ -541,27 +561,41 @@ fn firejail_args_rejected_description(error: &std::io::Error) -> String {
     )
 }
 
-/// Firejail was selected but its configured `firejail_args` were rejected.
-/// Running the command without them would present configured hardening as
-/// active when it is not, and running it unsandboxed would drop the sandbox
-/// altogether, so every command is refused with the reason instead.
-#[cfg(target_os = "linux")]
-struct RejectedFirejailArgsSandbox {
-    error: std::io::Error,
+/// A backend the operator selected that cannot confine commands as configured.
+///
+/// Used when an explicitly requested backend is unavailable, and when Firejail
+/// is selected but its configured `firejail_args` were rejected. Running the
+/// command without the backend (or without the rejected arguments) would drop
+/// the requested isolation or present configured hardening as active when it
+/// is not, so every command is refused with the reason instead.
+struct BlockedSandbox {
+    backend: &'static str,
+    error_kind: std::io::ErrorKind,
+    reason: String,
     description: String,
 }
 
-#[cfg(target_os = "linux")]
-impl Sandbox for RejectedFirejailArgsSandbox {
+impl BlockedSandbox {
+    /// An explicitly requested backend that could not be constructed.
+    fn requested_unavailable(requested: &SandboxBackend, reason: Option<&str>) -> Self {
+        let description =
+            requested_backend_unavailable_description(selected_backend_label(requested), reason);
+        Self {
+            backend: sandbox_backend_name(requested),
+            error_kind: std::io::ErrorKind::Unsupported,
+            reason: description.clone(),
+            description,
+        }
+    }
+}
+
+impl Sandbox for BlockedSandbox {
     fn wrap_command(&self, _cmd: &mut std::process::Command) -> std::io::Result<()> {
         self.check_initialization()
     }
 
     fn check_initialization(&self) -> std::io::Result<()> {
-        Err(std::io::Error::new(
-            self.error.kind(),
-            self.error.to_string(),
-        ))
+        Err(std::io::Error::new(self.error_kind, self.reason.clone()))
     }
 
     fn is_available(&self) -> bool {
@@ -569,11 +603,24 @@ impl Sandbox for RejectedFirejailArgsSandbox {
     }
 
     fn name(&self) -> &str {
-        "firejail"
+        self.backend
     }
 
     fn description(&self) -> &str {
         &self.description
+    }
+}
+
+fn requested_backend_unavailable_description(label: &str, reason: Option<&str>) -> String {
+    match reason {
+        Some(reason) => crate::i18n::get_required_cli_string_with_args(
+            "cli-security-sandbox-backend-unavailable",
+            &[("backend", label), ("reason", reason)],
+        ),
+        None => crate::i18n::get_required_cli_string_with_args(
+            "cli-security-sandbox-backend-unavailable-no-reason",
+            &[("backend", label)],
+        ),
     }
 }
 
@@ -582,9 +629,11 @@ fn create_firejail_sandbox(firejail_args: &[String]) -> Option<Arc<dyn Sandbox>>
     match super::firejail::FirejailSandbox::with_args(firejail_args) {
         Ok(sandbox) => Some(Arc::new(sandbox)),
         Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
-            Some(Arc::new(RejectedFirejailArgsSandbox {
+            Some(Arc::new(BlockedSandbox {
+                backend: "firejail",
+                error_kind: error.kind(),
                 description: firejail_args_rejected_description(&error),
-                error,
+                reason: error.to_string(),
             }))
         }
         Err(_) => None,
@@ -708,13 +757,15 @@ fn selected_backend_label(backend: &SandboxBackend) -> &'static str {
     }
 }
 
-fn log_requested_backend_unavailable(label: &'static str, reason: Option<String>) {
+fn log_requested_backend_unavailable(label: &'static str, reason: Option<&str>) {
     let detail = match reason {
         Some(reason) => format!(
-            "{label} requested but not available ({reason}), falling back to application-layer"
+            "{label} requested but not available ({reason}); commands are blocked instead of running unsandboxed"
         ),
         None => {
-            format!("{label} requested but not available, falling back to application-layer")
+            format!(
+                "{label} requested but not available; commands are blocked instead of running unsandboxed"
+            )
         }
     };
     ::zeroclaw_log::record!(
@@ -1184,8 +1235,122 @@ mod tests {
             &SandboxExtraRoots::default(),
             None,
         );
-        // If Docker is available, it will be selected; if not, NoopSandbox fallback.
-        assert!(sandbox.is_available());
+        // Docker is selected whether or not it is installed: when it is
+        // missing, commands are blocked rather than run unsandboxed.
+        assert_eq!(sandbox.name(), "docker");
+        if !sandbox.is_available() {
+            let mut command = std::process::Command::new("/bin/echo");
+            assert!(sandbox.wrap_command(&mut command).is_err());
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn explicit_unavailable_backend_blocks_commands_instead_of_running_unsandboxed() {
+        // sandbox-exec only exists on macOS, so it can never be built here.
+        let sandbox_cfg = SandboxConfig {
+            enabled: Some(true),
+            backend: SandboxBackend::SandboxExec,
+            firejail_args: Vec::new(),
+            ..SandboxConfig::default()
+        };
+        let sandbox = create_sandbox(
+            &sandbox_cfg,
+            RuntimeKind::Native,
+            None,
+            &SandboxExtraRoots::default(),
+            None,
+        );
+
+        assert_eq!(sandbox.name(), "sandbox-exec");
+        assert!(!sandbox.is_available());
+        let initialization = sandbox.check_initialization().unwrap_err();
+        assert_eq!(initialization.kind(), std::io::ErrorKind::Unsupported);
+        let expected = crate::i18n::get_required_cli_string_with_args(
+            "cli-security-sandbox-backend-unavailable-no-reason",
+            &[("backend", "sandbox-exec")],
+        );
+        assert_eq!(initialization.to_string(), expected);
+        assert_eq!(sandbox.description(), expected);
+
+        let mut command = std::process::Command::new("/bin/echo");
+        let error = sandbox.wrap_command(&mut command).unwrap_err();
+        assert_eq!(error.to_string(), expected);
+        assert_eq!(command.get_program(), "/bin/echo");
+        assert!(command.get_args().next().is_none());
+        let shell_error = sandbox
+            .wrap_shell_command(&mut command, Some(std::ffi::OsStr::new("sh")))
+            .unwrap_err();
+        assert_eq!(shell_error.to_string(), expected);
+
+        let posture = sandbox_posture(
+            &sandbox_cfg,
+            RuntimeKind::Native,
+            None,
+            &SandboxExtraRoots::default(),
+        );
+        assert_eq!(posture.requested_backend, "sandbox-exec");
+        assert_eq!(posture.active_backend, sandbox.name());
+        assert_eq!(posture.active_description, expected);
+        assert!(!posture.fallback);
+    }
+
+    #[test]
+    fn blocked_backend_reports_the_unavailable_reason() {
+        let sandbox = BlockedSandbox::requested_unavailable(
+            &SandboxBackend::Bubblewrap,
+            Some("bwrap missing"),
+        );
+
+        assert_eq!(sandbox.name(), "bubblewrap");
+        assert!(!sandbox.is_available());
+        let mut command = std::process::Command::new("/bin/echo");
+        let error = sandbox.wrap_command(&mut command).unwrap_err();
+        assert!(error.to_string().contains("Bubblewrap"), "{error}");
+        assert!(error.to_string().contains("bwrap missing"), "{error}");
+        assert_eq!(sandbox.description(), error.to_string());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn explicit_unavailable_backend_is_still_disabled_by_enabled_false() {
+        let sandbox_cfg = SandboxConfig {
+            enabled: Some(false),
+            backend: SandboxBackend::SandboxExec,
+            firejail_args: Vec::new(),
+            ..SandboxConfig::default()
+        };
+        let sandbox = create_sandbox(
+            &sandbox_cfg,
+            RuntimeKind::Native,
+            None,
+            &SandboxExtraRoots::default(),
+            None,
+        );
+
+        assert_eq!(sandbox.name(), "none");
+        assert!(sandbox.check_initialization().is_ok());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn explicit_unavailable_backend_on_docker_runtime_keeps_runtime_containment() {
+        let sandbox_cfg = SandboxConfig {
+            enabled: Some(true),
+            backend: SandboxBackend::SandboxExec,
+            firejail_args: Vec::new(),
+            ..SandboxConfig::default()
+        };
+        let sandbox = create_sandbox(
+            &sandbox_cfg,
+            RuntimeKind::Docker,
+            None,
+            &SandboxExtraRoots::default(),
+            None,
+        );
+
+        assert_eq!(sandbox.name(), "none");
+        assert!(sandbox.check_initialization().is_ok());
     }
 
     #[test]
