@@ -1,0 +1,214 @@
+name: Fork Images (GHCR)
+
+# Builds this fork's container images and publishes them to GHCR under the
+# repository owner's namespace, so they can be pulled without building locally:
+#
+#   ghcr.io/<owner>/zeroclaw          root Dockerfile, `release` target
+#                                     (distroless). Built with the fork's
+#                                     DEFAULT cargo features, which include
+#                                     sandbox-bubblewrap and sandbox-landlock.
+#   ghcr.io/<owner>/zeroclaw-pentest  pentest/Dockerfile (kali-rolling +
+#                                     toolstack, ZeroClaw under Landlock). This
+#                                     is the image the k8s/ manifests deploy.
+#
+# Upstream's docker-publish.yml is gated to zeroclaw-labs/zeroclaw, so it never
+# runs in a fork; this workflow is the fork's publish path.
+#
+# Tags (docker/metadata-action):
+#   push to master  -> latest, master, sha-<short>
+#   push of tag vX.Y.Z -> X.Y.Z, X.Y, sha-<short>
+#   pull_request    -> pr-<n>, built but NOT pushed (validation only)
+#   workflow_dispatch -> <branch>, sha-<short>; push only when `push` is set
+#
+# Each pushed image is signed by digest with keyless cosign (Sigstore/Rekor)
+# and carries BuildKit provenance + SBOM attestations.
+#
+# Visibility: a new GHCR package may start as private. Make each package public
+# once (Package settings -> Danger Zone -> Change visibility) so anonymous
+# `docker pull` / Kubernetes pulls work without an imagePullSecret.
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  pull_request:
+    branches: [master]
+    paths:
+      - Dockerfile
+      - pentest/**
+      - .dockerignore
+      - Cargo.toml
+      - Cargo.lock
+      - .github/workflows/fork-images.yml
+  workflow_dispatch:
+    inputs:
+      push:
+        description: "Push and sign the images (leave off for a dry-run build)"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-images-${{ github.ref }}
+  # A newer push to the same PR supersedes the running validation build;
+  # publishes from master/tags are never cancelled midway.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  image:
+    name: Build ${{ matrix.name }}
+    if: github.repository != 'zeroclaw-labs/zeroclaw'
+    runs-on: ubuntu-latest
+    # Fat LTO with codegen-units = 1 (profile.release) dominates the build.
+    timeout-minutes: 150
+    permissions:
+      contents: read
+      packages: write
+      id-token: write # keyless cosign signing (OIDC)
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: zeroclaw
+            suffix: ""
+            dockerfile: Dockerfile
+            target: release
+            # Empty flags: the root Dockerfile then builds the crate's default
+            # features (the fork's default set includes the native sandboxes).
+            # Its generated ARG default is the upstream `dist` list, which has
+            # neither sandbox backend.
+            extra_build_arg: "ZEROCLAW_CARGO_FLAGS="
+            gha_cache: true
+          - name: zeroclaw-pentest
+            suffix: "-pentest"
+            dockerfile: pentest/Dockerfile
+            target: runtime
+            extra_build_arg: ""
+            # The kali runtime layer is several GB (metasploit et al.);
+            # exporting it would evict everything else from the 10 GB GHA cache.
+            gha_cache: false
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Resolve image name and publish mode
+        id: vars
+        shell: bash
+        env:
+          SUFFIX: ${{ matrix.suffix }}
+          EVENT: ${{ github.event_name }}
+          DISPATCH_PUSH: ${{ inputs.push }}
+        run: |
+          # GHCR repository names must be lowercase.
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          echo "image=ghcr.io/${owner}/zeroclaw${SUFFIX}" >> "$GITHUB_OUTPUT"
+          case "${EVENT}" in
+            push) push=true ;;
+            workflow_dispatch) push="${DISPATCH_PUSH:-false}" ;;
+            *) push=false ;;
+          esac
+          echo "push=${push}" >> "$GITHUB_OUTPUT"
+
+      # The pentest image plus a cold Rust release build do not fit in the
+      # hosted runner's free disk; drop preinstalled toolchains this job never
+      # uses.
+      - name: Free runner disk space
+        shell: bash
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/share/swift
+          sudo docker image prune --all --force >/dev/null
+          df -h /
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Log in to GHCR
+        if: steps.vars.outputs.push == 'true'
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute tags and labels
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ steps.vars.outputs.image }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=short,prefix=sha-
+          # org.opencontainers.image.source/revision are added automatically and
+          # link the package to this repository.
+          labels: |
+            org.opencontainers.image.title=${{ matrix.name }}
+
+      - name: Build${{ steps.vars.outputs.push == 'true' && ' and push' || '' }} ${{ matrix.name }}
+        id: build
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          target: ${{ matrix.target }}
+          platforms: linux/amd64
+          push: ${{ steps.vars.outputs.push == 'true' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            ZEROCLAW_BUILD_ID=${{ github.sha }}
+            ${{ matrix.extra_build_arg }}
+          cache-from: ${{ matrix.gha_cache && format('type=gha,scope=fork-images-{0}', matrix.name) || '' }}
+          cache-to: ${{ matrix.gha_cache && format('type=gha,scope=fork-images-{0},mode=max,ignore-error=true', matrix.name) || '' }}
+          provenance: mode=max
+          sbom: true
+
+      - name: Install cosign
+        if: steps.vars.outputs.push == 'true'
+        uses: sigstore/cosign-installer@d7d6bc7722e3daa8354c50bcb52f4837da5e9b6a # v3.8.1
+
+      - name: Sign image by digest (keyless)
+        if: steps.vars.outputs.push == 'true'
+        env:
+          IMAGE: ${{ steps.vars.outputs.image }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "${IMAGE}@${DIGEST}"
+
+      - name: Summary
+        if: always() && steps.build.outcome == 'success'
+        shell: bash
+        env:
+          IMAGE: ${{ steps.vars.outputs.image }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          PUSHED: ${{ steps.vars.outputs.push }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+          REPO: ${{ github.repository }}
+        run: |
+          {
+            echo "### ${IMAGE}"
+            echo
+            if [ "${PUSHED}" = "true" ]; then
+              echo "Pushed \`${IMAGE}@${DIGEST}\`"
+              echo
+              echo '```sh'
+              echo "docker pull ${IMAGE}@${DIGEST}"
+              echo "cosign verify ${IMAGE}@${DIGEST} \\"
+              echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com \\"
+              echo "  --certificate-identity-regexp '^https://github.com/${REPO}/'"
+              echo '```'
+            else
+              echo "Built only (not pushed)."
+            fi
+            echo
+            echo "Tags:"
+            echo '```'
+            echo "${TAGS}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
