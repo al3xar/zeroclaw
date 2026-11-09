@@ -1,0 +1,208 @@
+# ZeroClaw multi-agent team for Kubernetes (schema v4).
+#
+#   general        orchestrator, the only agent on Telegram; delegates to:
+#   security_blue  defensive review, read-only workspace
+#   security_red   recon / scanning (nmap, nuclei, ...), network tools allowed
+#   coder          read-write development workspace
+#
+# This is the base example: overlays replace it with their own file
+# (configMapGenerator `behavior: replace`). No secrets here. Credentials come
+# from the `zeroclaw-env` Secret as env overrides, for this file:
+#   ZEROCLAW_providers__models__openai__llm__api_key
+#   ZEROCLAW_channels__telegram__default__bot_token
+#
+# Paths inside the pod:
+#   /var/lib/zeroclaw   daemon state ($HOME/.zeroclaw), volume zeroclaw-state
+#   /workspaces/<dir>   agent workspaces, volume zeroclaw-workspaces
+#
+# Sandbox: every profile uses Landlock. It confines the FILESYSTEM of each
+# command (workspace read-write, system paths read-only, nothing else) and
+# works under the `restricted` Pod Security Standard. It does not isolate the
+# network: the pod's NetworkPolicy is the network boundary for every agent.
+# bubblewrap (which also cuts the network) needs user namespaces and a fresh
+# /proc, which restricted pods do not allow; see k8s/README.md.
+#
+# Gateway host, port, allow_public_bind and require_pairing are forced by env
+# in the Deployment.
+
+locale = "en"
+schema_version = 4
+
+[runtime]
+kind = "native"
+
+# ---------------------------------------------------------------- provider
+# Any OpenAI-compatible endpoint (vLLM, llama.cpp server, LiteLLM, ...).
+[providers.models.openai.llm]
+model = "your-model"
+uri = "https://llm.example.internal/v1"
+context_window = 32768
+
+# ------------------------------------------------------------------ agents
+[agents.general]
+enabled = true
+model_provider = "openai.llm"
+risk_profile = "orchestrator"
+runtime_profile = "orchestrator"
+channels = ["telegram.default"]
+delegate_same_risk_profile = false
+delegates = [
+  { agent = "security_blue", mode = "independent" },
+  { agent = "security_red", mode = "independent" },
+  { agent = "coder", mode = "independent" },
+]
+
+[agents.general.workspace]
+path = "/workspaces/general"
+
+[agents.security_blue]
+enabled = true
+model_provider = "openai.llm"
+risk_profile = "security"
+runtime_profile = "security"
+
+[agents.security_blue.workspace]
+path = "/workspaces/blue"
+
+[agents.security_red]
+enabled = true
+model_provider = "openai.llm"
+risk_profile = "net"
+runtime_profile = "net"
+
+[agents.security_red.workspace]
+path = "/workspaces/red"
+
+[agents.coder]
+enabled = true
+model_provider = "openai.llm"
+risk_profile = "dev"
+runtime_profile = "dev"
+
+[agents.coder.workspace]
+path = "/workspaces/dev"
+
+# ----------------------------------------------------------- risk profiles
+[risk_profiles.orchestrator]
+level = "full"
+allowed_commands = ["*"]
+block_high_risk_commands = true
+forbidden_paths = ["/etc", "/root", "/home", "/usr", "/bin", "/sbin", "/lib", "/opt", "/boot", "/dev", "/proc", "/sys", "/var", "/tmp", "~/.ssh", "~/.gnupg", "~/.aws", "~/.config"]
+workspace_only = true
+allowed_roots = ["/workspaces/general"]
+sandbox_enabled = true
+sandbox_backend = "landlock"
+excluded_tools = ["browser", "browser_open", "http_request", "web_search", "web_fetch"]
+
+[risk_profiles.orchestrator.delegation_policy]
+mode = "allow"
+
+[risk_profiles.security]
+level = "full"
+allowed_commands = ["*"]
+# Blocks network clients (curl, wget, nc, ssh, ...) at the policy layer.
+block_high_risk_commands = true
+forbidden_paths = ["/etc", "/root", "/home", "/usr", "/bin", "/sbin", "/lib", "/opt", "/boot", "/dev", "/proc", "/sys", "/var", "/tmp", "~/.ssh", "~/.gnupg", "~/.aws", "~/.config"]
+workspace_only = true
+allowed_roots = ["/workspaces/blue"]
+sandbox_enabled = true
+sandbox_backend = "landlock"
+excluded_tools = ["browser", "browser_open", "http_request", "web_search", "web_fetch"]
+
+[risk_profiles.dev]
+level = "full"
+allowed_commands = ["*"]
+block_high_risk_commands = true
+forbidden_paths = ["/etc", "/root", "/home", "/usr", "/bin", "/sbin", "/lib", "/opt", "/boot", "/dev", "/proc", "/sys", "/var", "~/.ssh", "~/.gnupg", "~/.aws", "~/.config"]
+workspace_only = true
+allowed_roots = ["/workspaces/dev"]
+sandbox_enabled = true
+sandbox_backend = "landlock"
+
+[risk_profiles.net]
+level = "full"
+allowed_commands = ["*"]
+# Network clients allowed: this is the recon agent. Scope its reach with the
+# pod NetworkPolicy (k8s/overlays/example/networkpolicy-egress.yaml).
+block_high_risk_commands = false
+require_approval_for_medium_risk = false
+forbidden_paths = ["/etc", "/root", "/home", "/usr", "/bin", "/sbin", "/lib", "/opt", "/boot", "/dev", "/proc", "/sys", "/var", "~/.ssh", "~/.gnupg", "~/.aws", "~/.config"]
+workspace_only = true
+allowed_roots = ["/workspaces/red"]
+sandbox_enabled = true
+sandbox_backend = "landlock"
+
+[risk_profiles.net.approval_route]
+approver_channel = "telegram.default"
+on_no_approver = "deny"
+timeout_secs = 300
+
+# -------------------------------------------------------- runtime profiles
+[runtime_profiles.orchestrator]
+max_actions_per_hour = 240
+shell_timeout_secs = 600
+max_history_messages = 20
+
+[runtime_profiles.orchestrator.tool_receipts]
+enabled = true
+
+[runtime_profiles.security]
+max_actions_per_hour = 240
+shell_timeout_secs = 600
+max_history_messages = 20
+
+[runtime_profiles.security.tool_receipts]
+enabled = true
+
+[runtime_profiles.dev]
+max_actions_per_hour = 240
+shell_timeout_secs = 900
+max_history_messages = 20
+
+[runtime_profiles.dev.tool_receipts]
+enabled = true
+
+[runtime_profiles.net]
+max_actions_per_hour = 60
+shell_timeout_secs = 1800
+max_history_messages = 20
+
+[runtime_profiles.net.tool_receipts]
+enabled = true
+
+# ----------------------------------------------------------------- gateway
+[gateway]
+port = 42617
+web_dist_dir = "/usr/share/zeroclawlabs/web/dist"
+
+# ------------------------------------------------------------------ budget
+[cost]
+enabled = true
+daily_limit_usd = 10.0
+monthly_limit_usd = 100.0
+warn_at_percent = 80
+allow_override = false
+
+# ----------------------------------------------------------------- secrets
+# Values written to config.toml at runtime are encrypted with
+# $HOME/.zeroclaw/.secret_key (state volume).
+[secrets]
+encrypt = true
+
+# ---------------------------------------------------------------- Telegram
+# bot_token comes from the Secret. Use a bot token that no other ZeroClaw /
+# bot instance polls, or both get HTTP 409 Conflict.
+[channels.telegram.default]
+enabled = true
+
+# Default-closed allowlist: put the numeric Telegram user IDs (as strings)
+# allowed to talk to the bot. Never "*".
+[peer_groups.telegram_default]
+channel = "telegram.default"
+external_peers = []
+
+[tools]
+optional = ["*"]
+
+[memory]
+search_mode = "bm25"

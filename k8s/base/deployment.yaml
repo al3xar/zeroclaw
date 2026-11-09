@@ -1,0 +1,171 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: zeroclaw
+spec:
+  # Exactly one replica, replaced (not rolled): the daemon is the single writer
+  # of the ReadWriteOnce volumes, and a Telegram bot token supports one
+  # long-poll consumer only (a second one gets HTTP 409 Conflict).
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: zeroclaw
+      app.kubernetes.io/component: agent
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: zeroclaw
+        app.kubernetes.io/component: agent
+    spec:
+      serviceAccountName: zeroclaw
+      automountServiceAccountToken: false
+      # Service-link variables (ZEROCLAW_SERVICE_HOST, ...) would share the
+      # daemon's ZEROCLAW_ env prefix.
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        # Writes config.toml from the ConfigMap onto the state volume (keeping
+        # runtime pairings) and copies workspace files such as SOUL.md.
+        - name: seed
+          image: zeroclaw-pentest
+          command: ["/bin/bash", "/opt/zeroclaw-seed/seed-config.sh"]
+          env:
+            - name: HOME
+              value: /var/lib/zeroclaw
+            - name: WORKSPACES_ROOT
+              value: /workspaces
+            # Workspace directories created up front (one per agent).
+            - name: WORKSPACE_DIRS
+              value: "general blue red dev"
+            # always: the ConfigMap is the source of truth on every start.
+            # once:   seed only a missing config.toml; later edits made with
+            #         `zeroclaw config set` or the dashboard persist.
+            - name: ZEROCLAW_CONFIG_SEED
+              value: always
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              memory: 64Mi
+          volumeMounts:
+            - name: state
+              mountPath: /var/lib/zeroclaw
+            - name: workspaces
+              mountPath: /workspaces
+            - name: tmp
+              mountPath: /tmp
+            - name: config
+              mountPath: /etc/zeroclaw/config
+              readOnly: true
+            - name: workspace-files
+              mountPath: /etc/zeroclaw/workspace-files
+              readOnly: true
+            - name: seed
+              mountPath: /opt/zeroclaw-seed
+              readOnly: true
+      containers:
+        - name: zeroclaw
+          image: zeroclaw-pentest
+          args: ["daemon"]
+          env:
+            # State lives on the volume, not in the image's /home/zeroclaw.
+            - name: HOME
+              value: /var/lib/zeroclaw
+            - name: LANG
+              value: C.UTF-8
+            - name: SHELL
+              value: /bin/bash
+            # The gateway must listen on the pod IP for probes and the Service.
+            # Exposure is bounded by the NetworkPolicy (no ingress by default)
+            # and pairing stays mandatory regardless of config.toml.
+            - name: ZEROCLAW_gateway__host
+              value: 0.0.0.0
+            - name: ZEROCLAW_gateway__port
+              value: "42617"
+            - name: ZEROCLAW_gateway__allow_public_bind
+              value: "true"
+            - name: ZEROCLAW_gateway__require_pairing
+              value: "true"
+          # Credentials as ZEROCLAW_<dotted__path> variables, e.g.
+          # ZEROCLAW_providers__models__openai__llm__api_key. Provided by the
+          # overlay. An unknown ZEROCLAW_ path stops the daemon at startup.
+          envFrom:
+            - secretRef:
+                name: zeroclaw-env
+          ports:
+            - name: gateway
+              containerPort: 42617
+              protocol: TCP
+          startupProbe:
+            httpGet:
+              path: /health
+              port: gateway
+            periodSeconds: 5
+            failureThreshold: 60
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: gateway
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: gateway
+            periodSeconds: 10
+            timeoutSeconds: 5
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              # Scanners (nmap, nuclei, sqlmap, metasploit) run inside the pod.
+              memory: 4Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: state
+              mountPath: /var/lib/zeroclaw
+            - name: workspaces
+              mountPath: /workspaces
+            # Landlock requires /tmp (granted to commands without execute).
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: state
+          persistentVolumeClaim:
+            claimName: zeroclaw-state
+        - name: workspaces
+          persistentVolumeClaim:
+            claimName: zeroclaw-workspaces
+        - name: tmp
+          emptyDir:
+            sizeLimit: 2Gi
+        - name: config
+          configMap:
+            name: zeroclaw-config
+        - name: workspace-files
+          configMap:
+            name: zeroclaw-workspace-files
+        - name: seed
+          configMap:
+            name: zeroclaw-seed

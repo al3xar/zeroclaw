@@ -1,0 +1,50 @@
+# Default posture for the agent pod. NetworkPolicies are additive: overlays and
+# components add allow rules (LLM endpoint on a private network, pentest
+# scope, ingress controller) with policies of their own.
+#
+# Every agent shares the pod network. Landlock confines files only, so this
+# policy is the network boundary for all agent commands. Enforcement needs a
+# CNI that implements NetworkPolicy (Calico, Cilium, kindnet >= v0.24, ...).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: zeroclaw-default
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: zeroclaw
+      app.kubernetes.io/component: agent
+  policyTypes:
+    - Ingress
+    - Egress
+  # No ingress. `kubectl port-forward` goes through the kubelet and is not
+  # affected; kubelet probes from the node are allowed by common CNIs.
+  ingress: []
+  egress:
+    # Cluster DNS.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # HTTPS to public addresses: hosted LLM providers, api.telegram.org.
+    # Private, link-local (cloud metadata) and CGNAT ranges are excluded.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+              - 100.64.0.0/10
+      ports:
+        - protocol: TCP
+          port: 443

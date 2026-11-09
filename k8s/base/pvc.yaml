@@ -1,0 +1,27 @@
+# Daemon state: $HOME/.zeroclaw (config.toml, the secret-encryption key,
+# memory, sessions, pairing). Mounted at /var/lib/zeroclaw, which every
+# risk profile lists under forbidden_paths and Landlock never grants, so
+# agent commands cannot read it.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: zeroclaw-state
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 2Gi
+---
+# Agent workspaces: /workspaces/<dir>, one directory per agent. The only
+# paths agent commands can write (Landlock allowed_roots).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: zeroclaw-workspaces
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi

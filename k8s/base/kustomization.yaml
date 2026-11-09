@@ -1,0 +1,48 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# ZeroClaw multi-agent deployment (pentest image, Landlock sandbox).
+# Not meant to be applied on its own: an overlay supplies credentials (keys of
+# the `zeroclaw-env` Secret) and, normally, its own config.toml. See
+# k8s/README.md and k8s/overlays/example/.
+
+namespace: zeroclaw
+
+labels:
+  - pairs:
+      app.kubernetes.io/name: zeroclaw
+      app.kubernetes.io/part-of: zeroclaw
+    includeSelectors: false
+
+resources:
+  - namespace.yaml
+  - serviceaccount.yaml
+  - pvc.yaml
+  - deployment.yaml
+  - service.yaml
+  - networkpolicy.yaml
+
+configMapGenerator:
+  # The daemon's config.toml. The seed init container copies it onto the state
+  # volume on every start (see seed-config.sh); overlays replace it.
+  - name: zeroclaw-config
+    files:
+      - config.toml
+  - name: zeroclaw-seed
+    files:
+      - seed-config.sh
+  # Files copied into agent workspaces on every start. Key format:
+  # <workspace-dir>__<file>, e.g. `general__SOUL.md` -> /workspaces/general/SOUL.md.
+  # Empty here; overlays add keys with `behavior: merge`.
+  - name: zeroclaw-workspace-files
+
+secretGenerator:
+  # Credentials as ZEROCLAW_<dotted__path> env overrides (envFrom on the daemon
+  # container). Empty here; overlays add keys with `behavior: merge`, which
+  # also keeps the hashed name reference and rolls the pod on changes.
+  - name: zeroclaw-env
+
+images:
+  - name: zeroclaw-pentest
+    newName: ghcr.io/al3xar/zeroclaw-pentest
+    newTag: latest

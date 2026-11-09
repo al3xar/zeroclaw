@@ -1,0 +1,45 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Example overlay. Copy this directory outside the repository (it will hold
+# deployment-specific values), then:
+#   cp zeroclaw.env.example zeroclaw.env   # fill in, chmod 600
+#   kubectl apply -k .
+#
+# When the copy lives elsewhere, point `resources` at the base by path or by
+# URL, e.g. https://github.com/al3xar/zeroclaw//k8s/base?ref=master
+
+resources:
+  - ../../base
+  - networkpolicy-egress.yaml
+
+# Publish the dashboard through an Ingress controller (patch host/class/TLS):
+# components:
+#   - ../../components/ingress
+
+configMapGenerator:
+  # Your own config.toml (start from ../../base/config.toml).
+  # - name: zeroclaw-config
+  #   behavior: replace
+  #   files:
+  #     - config.toml
+  # Personality / instruction files copied into each workspace on start.
+  - name: zeroclaw-workspace-files
+    behavior: merge
+    files:
+      - general__SOUL.md=souls/general.SOUL.md
+
+# Credentials as ZEROCLAW_* env overrides (envFrom on the daemon container).
+# zeroclaw.env is kept out of git by .gitignore.
+secretGenerator:
+  - name: zeroclaw-env
+    behavior: merge
+    envs:
+      - zeroclaw.env
+
+images:
+  - name: zeroclaw-pentest
+    newName: ghcr.io/al3xar/zeroclaw-pentest
+    # Pin a published commit tag (sha-<short>) or digest for reproducible
+    # rollouts; `latest` follows master.
+    newTag: latest

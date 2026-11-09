@@ -1,0 +1,29 @@
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+# Optional: publish the gateway (dashboard, webhook, pairing) through an
+# Ingress controller with TLS. Pairing stays mandatory.
+#
+# The overlay must patch:
+#   - Ingress `zeroclaw`: host, ingressClassName, TLS secret / issuer
+#   - NetworkPolicy `zeroclaw-from-ingress`: the controller's namespace label
+#     (default: ingress-nginx)
+#
+# Rate limiting keys on X-Forwarded-For from the controller
+# (gateway.trust_forwarded_headers); only enable this component when every
+# request reaches the pod through the controller.
+
+resources:
+  - ingress.yaml
+  - networkpolicy.yaml
+
+patches:
+  - target:
+      kind: Deployment
+      name: zeroclaw
+    patch: |-
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value:
+          name: ZEROCLAW_gateway__trust_forwarded_headers
+          value: "true"
