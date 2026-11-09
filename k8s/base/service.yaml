@@ -1,0 +1,17 @@
+# In-cluster only. Reach the dashboard / webhook with
+#   kubectl -n zeroclaw port-forward svc/zeroclaw 42617:42617
+# or add the ingress component (k8s/components/ingress).
+apiVersion: v1
+kind: Service
+metadata:
+  name: zeroclaw
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: zeroclaw
+    app.kubernetes.io/component: agent
+  ports:
+    - name: gateway
+      port: 42617
+      targetPort: gateway
+      protocol: TCP

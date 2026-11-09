@@ -1,0 +1,30 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: zeroclaw
+  annotations:
+    # ingress-nginx: the dashboard keeps a WebSocket open for chat streaming.
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-body-size: "16m"
+    # Optional source allowlist (ingress-nginx), e.g. LAN only:
+    # nginx.ingress.kubernetes.io/whitelist-source-range: "192.168.1.0/24"
+    # With cert-manager:
+    # cert-manager.io/cluster-issuer: my-issuer
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - zeroclaw.example.internal
+      secretName: zeroclaw-tls
+  rules:
+    - host: zeroclaw.example.internal
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: zeroclaw
+                port:
+                  name: gateway
